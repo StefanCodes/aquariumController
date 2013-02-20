@@ -1,7 +1,23 @@
+/*
+  Troller - a multipurpose aquarium controller for Arduino
+ Copyright (c) 2013 Stefan Mohr. All rights reserved
+ 
+ This library is free software; you can redistribute it and/or
+ modify it under the terms of the GNU Lesser General Public
+ License as published by the Free Software Foundation; either
+ version 2.1 of the License, or (at your option) any later version.
+ 
+ This library is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ Lesser General Public License for more details.
+ 
+ You should have received a copy of the GNU Lesser General Public
+ License along with this library; if not, write to the Free Software
+ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+ */
+
 /***************************************************
- * Author: Stefan Mohr (stefan@stefanmohr.com)
- * License: This software is released into the public domain without license.
- * 
  * This Arduino sketch implements an aquarium controller. It expects an aquarium system
  * with a light fixture with 2 separate circuits (wired to 110V outlet box and switched by 
  * relay by Arduino), a (PH/KH) dosing pump (diaphragm style, powered by an independent power supply
@@ -19,21 +35,119 @@
  * I built a simple level converter as laid out in: http://www.fritz-hut.com/connecting-an-arduino-and-raspberry-pi/
  * The circuit can fit on a small circuit board and I will etch a matchbook-sized PCB and try to
  * fit it inside the relatively tight Raspberry Pi case.
- * 
- * 
  ***************************************************/
 
+
+// RTC - using davidhbrown's nice library: https://github.com/davidhbrown/RealTimeClockDS1307
+#include <Wire.h>
+#include <RealTimeClockDS1307.h>
+#include <Time.h>
+
+#include <SD.h>
+
 // Configurable globals
-
-
-// Default constants
-#define BAUD_RATE 19200
-#define COMMANDBUFFERSIZE 4 // the maximum length of a command sent by a serial controller
-
 // Some sanity checking constants to ensure the controller can't force the tank to dangerous levels
 #define MIN_ALLOWABLE_TARGET_PH 6.0 // minimum target pH the Arduino will accept
 #define MAX_ALLOWABLE_TARGET_PH 7.2 // maximum target pH the Arduino will accept
 #define MAX_ALLOWABLE_ACTION_PH_DRIFT 0.5 // the maximum drift in pH the Arduino will allow 
+
+// Default constants
+#define BAUD_RATE 19200
+#define COMMANDBUFFERSIZE 25 // the maximum possible length of a command sent by a controller
+#define COMMAND_END_CHAR '~' // char that the Pi can send to indicate end of command
+
+// pH sensor constants (http://www.practicalmaker.com/documentation/bnc-sensor-shield-documentation)
+#define PH_PIN 5 // analog pin connected to the pH sensor shield
+#define ARDUINO_VOLTAGE 5.0 // for pH probe: measure 
+// PH_GAIN is (4000mv / (59.2 * 7)) // 4000mv is max output and 59.2 * 7 is the maximum range (in millivolts) for the ph probe. 
+#define PH_GAIN 9.6525
+#define PH_SAMPLES_PER_READING 50 // number of samples to average out when measuring pH
+#define PH_DELAY_PER_SAMPLE 10 // delay between sampling the pH probe (ms)
+
+
+char phHolder[20]; // char buffer to hold the pH value converted from float to string (see GetPh())
+
+void setup()  
+{
+  RTC.switchTo24h();
+  Serial.begin(BAUD_RATE);
+  Serial.println("Startup");
+  // todo: read config from SD card
+}
+
+char commandBuffer[COMMANDBUFFERSIZE]; // the buffer for a command recieved by a serial controller (Raspberry Pi)
+int commandBufferIndex;
+
+void loop()
+{
+  RTC.readClock();
+  // First check for serial traffic and process serial commands
+  if (Serial.available())
+  {
+    // messages can be terminated or just wait 1000ms for readBytesUntil to timeout
+    Serial.readBytesUntil(COMMAND_END_CHAR, commandBuffer, COMMANDBUFFERSIZE);
+    // commandBuffer now contains an ASCII character command.
+    // the commands are parsed across a variety of functions as a finite state machine. if an unsupported character is encountered,
+    // processing stops. 
+    switch (commandBuffer[0])
+    {
+    case 'G':
+      Serial.println(FsmGet());
+      break;
+    case 'S':
+      Serial.println(FsmSet());
+      break;
+    default:
+      break;
+    }
+
+    for (commandBufferIndex = 0; commandBufferIndex < COMMANDBUFFERSIZE; commandBufferIndex++)
+    {
+      commandBuffer[commandBufferIndex] = '\0';
+    }
+  }
+
+  // Measure levels and take action if needed
+  CheckForTrouble();
+
+  // Check if lights need to be toggled
+
+  // Check if dosing pump needs to be toggled
+
+  // Check if CO2 needs to be toggled
+}
+
+//time_t lightsOn;
+
+void CheckForTrouble(){
+  // Measure levels
+  /*  float pH = ReadPh();
+   float temperature = ReadTemperature();
+   float flowRate = ReadFlowRate();
+   boolean isDosing = IsDosingPumpRunning();
+   boolean isCo2 = IsCo2Flowing();
+   boolean isLight1On = IsLightOn(1);
+   boolean isLight2On = IsLightOn(2);
+   */
+
+}
+
+// I have 2x54W on one circuit and 2x54W on another
+#define NUM_LIGHT_CIRCUITS 2
+
+
+
+#define OK 0x1A // command OK
+
+#define UNKNOWN_GET "0x20" // GET aquarium system unknown
+#define UNKNOWN_GET_LIGHT "0x21"
+
+#define UNKNOWN_SET "0x30" // SET aquarium system unknown
+#define UNKNOWN_SET_LIGHT "0x31"
+
+
+
+
 
 /* 
  Light Circuits (GL command: Get Lights)
@@ -142,90 +256,9 @@
  any parameters are at warning levels. For example, if the pH is crashing below (target pH)-(warning pH), a command
  to turn on CO2 injection will be ignored as unsafe. It's generally intended that the Arduino will not be ordered around by 
  a controller, but will instead be given parameters to make decisions (such as target pH and action pH levels). As such,
- the Arduino's internal safeties take precedent over a (potentially untrustworthy) Raspberry Pi.
- 
- 
- 
+ the Arduino's internal safeties take precedent over a (potentially compromised) Raspberry Pi.
  
  */
-
-#include <SoftwareSerial.h>
-
-SoftwareSerial mySerial(2, 3); // RX, TX
-
-void setup()  
-{
-  mySerial.begin(BAUD_RATE);
-  mySerial.println("Startup");
-}
-
-char commandBuffer[COMMANDBUFFERSIZE]; // the buffer for a command recieved by a serial controller (Raspberry Pi)
-int commandBufferIndex;
-void loop()
-{
-  for (commandBufferIndex = 0; commandBufferIndex < COMMANDBUFFERSIZE; commandBufferIndex++){
-    commandBuffer[commandBufferIndex] = '\0';
-  }
-  if (mySerial.available()){
-    // messages can be terminated by '~' to be processed immediately, or just wait 1000ms for readBytesUntil to timeout
-    mySerial.readBytesUntil('~', commandBuffer, COMMANDBUFFERSIZE);
-
-    // commandBuffer now contains an ASCII command.
-    switch (commandBuffer[0]){
-    case 'G':
-    case 'g':
-      Get(commandBuffer);
-      break;
-    case 'S':
-    case 's':
-      Set(commandBuffer);
-      break;
-    default:
-      break;
-    }
-  }
-}
-
-
-// Sends the result message to the serial partner (Raspberry Pi).
-void sendSerial(char message[]){
-  mySerial.println(message);
-}
-
-
-// Sends the current pH reading as an ASCII string (e.g. 6.85)
-void sendPh(char probeNum){
-  // add support for more probes if you want
-  // TODO: implement code to read pH from probe and format into an ASCII string
-  sendSerial("6.85");
-}
-
-
-void sendDosingPumpState(char pumpNum){
-  //  add support for more pumps if you want
-  // TODO: implement code to tap into dosing pump status. none of this code exists yet.
-  sendSerial("OFF");
-}
-
-// Sends the current status of the lights
-void sendLights(char lightCircuitNum){
-  // TODO: Get the relay shield...
-  if (lightCircuitNum == '1'){
-    // figure out if relay is powered. return ON or OFF if NO relay is closed
-    sendSerial("ON");
-  }
-  else if (lightCircuitNum == '2'){
-    // figure out if relay is powered. return ON or OFF if NO relay is closed
-    sendSerial("OFF");
-  }
-}
-
-
-
-
-
-
-
 
 
 
